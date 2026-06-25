@@ -1,0 +1,34 @@
+# Dependencies (reinstalled inside the image)
+node_modules
+
+# Build output (rebuilt inside the image)
+dist
+out-tsc
+tmp
+
+# Angular cache
+.angular
+
+# Tests & coverage
+coverage
+
+# Docker / orchestration files
+Dockerfile
+.dockerignore
+docker-compose.yml
+k8s
+
+# Git & CI
+.git
+.gitignore
+.github
+.gitlab-ci.yml
+
+# IDE & editor
+.vscode
+.idea
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
