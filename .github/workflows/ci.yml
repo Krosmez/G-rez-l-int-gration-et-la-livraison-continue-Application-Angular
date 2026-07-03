@@ -130,6 +130,23 @@ jobs:
       - name: Récupérer le code
         uses: actions/checkout@v4
 
+      # --- Détection du type de projet (même logique que le job `test`) -----
+      # Détermine quel smoke test appliquer : une app Java a une dépendance
+      # runtime (PostgreSQL), une app Angular servie par Nginx est autonome.
+      - name: Détecter le type de projet
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+            echo "Projet Node/Angular détecté."
+          elif [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            echo "Projet Java/Gradle détecté."
+          else
+            echo "::error::Type de projet non reconnu (ni package.json ni Gradle)."
+            exit 1
+          fi
+
       # Configure Buildx (moteur de build moderne + cache).
       - name: Configurer Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -161,11 +178,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # --- Point de vigilance : valider que l'image est fonctionnelle -------
-      # Smoke test générique : le conteneur doit démarrer et rester vivant
-      # (détecte un crash au boot, panne la plus fréquente). Pas de dépendance
-      # à un port applicatif précis -> valable pour Nginx comme pour un jar.
-      - name: Smoke test de l'image
+      # --- Smoke test ADAPTATIF selon le type de projet ---------------------
+      # Angular (Nginx) : autonome, aucune dépendance -> on vérifie simplement
+      # que le conteneur démarre et reste vivant (détecte un crash au boot).
+      - name: Smoke test de l'image (Angular)
+        if: steps.detect.outputs.type == 'node'
         run: |
           set -euo pipefail
           docker run -d --name smoke-test "${{ steps.meta.outputs.ref }}"
@@ -176,7 +193,75 @@ jobs:
             exit 1
           fi
           echo "Conteneur opérationnel."
-          docker rm -f smoke-test
+
+      # Java (Spring Boot) : dépendance runtime obligatoire à PostgreSQL.
+      # On démarre une base éphémère sur un réseau Docker dédié, on branche
+      # l'application dessus via SPRING_DATASOURCE_*, puis on attend que l'API
+      # réponde réellement sur le port 8080 (un simple "reste vivant" ne suffit
+      # pas : c'est le démarrage complet du contexte Spring qu'on valide).
+      - name: Smoke test de l'image (Java + PostgreSQL)
+        if: steps.detect.outputs.type == 'gradle'
+        run: |
+          set -euo pipefail
+          docker network create smoke-net
+
+          # Base de données éphémère (mêmes identifiants que docker-compose.yml)
+          docker run -d --name smoke-db --network smoke-net \
+            -e POSTGRES_USER=workshops_user \
+            -e POSTGRES_PASSWORD=oc2024 \
+            -e POSTGRES_DB=workshopsdb \
+            postgres:13
+
+          # Attendre que PostgreSQL accepte les connexions
+          echo "Attente de PostgreSQL..."
+          for i in $(seq 1 30); do
+            if docker exec smoke-db pg_isready -U workshops_user -d workshopsdb >/dev/null 2>&1; then
+              echo "PostgreSQL prêt."
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::PostgreSQL n'a pas démarré à temps."
+              docker logs smoke-db
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # Lancer l'application connectée à la base éphémère
+          docker run -d --name smoke-test --network smoke-net -p 8080:8080 \
+            -e SPRING_DATASOURCE_URL=jdbc:postgresql://smoke-db:5432/workshopsdb \
+            -e SPRING_DATASOURCE_USERNAME=workshops_user \
+            -e SPRING_DATASOURCE_PASSWORD=oc2024 \
+            "${{ steps.meta.outputs.ref }}"
+
+          # Attendre une réponse HTTP (n'importe quel code prouve que Tomcat et
+          # le contexte Spring ont démarré). On échoue vite si le conteneur crashe.
+          echo "Attente du démarrage de l'application..."
+          for i in $(seq 1 40); do
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke-test)" != "true" ]; then
+              echo "::error::Le conteneur applicatif s'est arrêté prématurément."
+              docker logs smoke-test
+              exit 1
+            fi
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/ || echo 000)"
+            if [ "$code" != "000" ]; then
+              echo "Application opérationnelle (réponse HTTP $code)."
+              break
+            fi
+            if [ "$i" -eq 40 ]; then
+              echo "::error::L'application n'a pas répondu sur le port 8080 dans le délai imparti."
+              docker logs smoke-test
+              exit 1
+            fi
+            sleep 3
+          done
+
+      # Nettoyage systématique des ressources du smoke test (succès comme échec).
+      - name: Nettoyer les ressources du smoke test
+        if: always()
+        run: |
+          docker rm -f smoke-test smoke-db >/dev/null 2>&1 || true
+          docker network rm smoke-net >/dev/null 2>&1 || true
 
       # --- Connexion à GHCR (uniquement hors pull_request) ------------------
       # On ne publie pas depuis une PR (le GITHUB_TOKEN d'une PR de fork n'a pas
@@ -227,23 +312,101 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configurer Node.js
+      # --- Détection du type de projet (même logique que les autres jobs) ----
+      # semantic-release est un outil Node, mais le DÉPÔT versionné peut être
+      # Node (Angular) ou non (Java/Gradle). On adapte la configuration Node en
+      # conséquence pour ne pas bloquer sur un cache/lockfile inexistant.
+      - name: Détecter le type de projet
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+            echo "Projet Node/Angular détecté."
+          elif [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            echo "Projet Java/Gradle détecté."
+          else
+            echo "::error::Type de projet non reconnu (ni package.json ni Gradle)."
+            exit 1
+          fi
+
+      # Cache npm UNIQUEMENT pour un vrai projet Node (présence d'un lockfile) :
+      # sur un projet Gradle, `cache: npm` échouerait faute de package-lock.json.
+      - name: Configurer Node.js (requis par semantic-release)
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          cache: ${{ steps.detect.outputs.type == 'node' && 'npm' || '' }}
 
-      - name: Installer les dépendances (npm ci)
-        run: npm ci
+      # --- Installation ADAPTATIVE de la chaîne semantic-release -------------
+      # Node   : semantic-release et ses plugins sont des devDependencies -> npm ci.
+      # Gradle : aucun package.json -> on installe la chaîne à la volée, sans
+      #          polluer le dépôt (--no-save).
+      - name: Installer la chaîne de release
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.type }}" = "node" ]; then
+            npm ci
+          else
+            npm install --no-save \
+              semantic-release \
+              @semantic-release/commit-analyzer \
+              @semantic-release/release-notes-generator \
+              @semantic-release/changelog \
+              @semantic-release/exec \
+              @semantic-release/git \
+              @semantic-release/github
+          fi
 
       # semantic-release analyse les commits, calcule la version, crée la
-      # release GitHub + CHANGELOG, bump package.json, et — via le plugin exec —
-      # expose la version calculée dans la sortie d'étape `version`.
+      # release GitHub + CHANGELOG et — via le plugin exec — expose la version
+      # calculée dans la sortie d'étape `version`.
+      #
+      # Config ADAPTATIVE :
+      #  - Node   : on utilise la config du dépôt (.releaserc / clé "release"),
+      #             qui gère le bump de package.json + CHANGELOG.
+      #  - Gradle : le dépôt n'embarque pas de config de release -> on en génère
+      #             une par défaut. Elle bump `version` dans build.gradle (via
+      #             exec/prepareCmd), génère le CHANGELOG.md, committe les deux
+      #             en retour (plugin git) et émet la version pour le re-tag.
       - name: Lancer semantic-release
         id: semantic
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # secret injecté, jamais loggé
-        run: npx semantic-release
+        run: |
+          set -euo pipefail
+          has_config=false
+          for f in .releaserc .releaserc.json .releaserc.yaml .releaserc.yml .releaserc.js .releaserc.cjs release.config.js release.config.cjs; do
+            [ -f "$f" ] && has_config=true && break
+          done
+          if [ "$has_config" = false ] && grep -q '"release"' package.json 2>/dev/null; then
+            has_config=true
+          fi
+
+          if [ "$has_config" = false ]; then
+            echo "Aucune config de release dans le dépôt : génération d'une config par défaut."
+            cat > .releaserc.json <<'EOF'
+          {
+            "branches": ["main"],
+            "plugins": [
+              "@semantic-release/commit-analyzer",
+              "@semantic-release/release-notes-generator",
+              "@semantic-release/changelog",
+              ["@semantic-release/exec", {
+                "verifyReleaseCmd": "echo \"version=${nextRelease.version}\" >> \"$GITHUB_OUTPUT\"",
+                "prepareCmd": "sed -i -E \"s/^version = .*/version = '${nextRelease.version}'/\" build.gradle"
+              }],
+              ["@semantic-release/git", {
+                "assets": ["build.gradle", "CHANGELOG.md"],
+                "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+              }],
+              "@semantic-release/github"
+            ]
+          }
+          EOF
+          fi
+
+          npx semantic-release
 
       # --- Re-tag de l'image Docker avec la version sémantique --------------
       # Seulement si une nouvelle version a été publiée (sortie non vide).
