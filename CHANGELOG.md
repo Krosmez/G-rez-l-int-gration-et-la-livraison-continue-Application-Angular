@@ -1,3 +1,11 @@
+# [1.1.0](https://github.com/Krosmez/G-rez-l-int-gration-et-la-livraison-continue-Application-Angular/compare/v1.0.0...v1.1.0) (2026-07-03)
+
+
+### Features
+
+* update ci for Java ([f8ec3fc](https://github.com/Krosmez/G-rez-l-int-gration-et-la-livraison-continue-Application-Angular/commit/f8ec3fcae196851504168263d8a06305d3ce9065))
+* update to pass smoke tests for Java and Angular ([29e217d](https://github.com/Krosmez/G-rez-l-int-gration-et-la-livraison-continue-Application-Angular/commit/29e217dcf61b9c188366455ff8b767e130f83bbe))
+
 # 1.0.0 (2026-07-03)
 
 
