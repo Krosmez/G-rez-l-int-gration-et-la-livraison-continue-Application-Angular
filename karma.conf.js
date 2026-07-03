@@ -35,7 +35,12 @@ module.exports = function (config) {
     },
     reporters: ['progress', 'junit'],
     junitReporter: {
-      outputDir: 'reports',
+      // Rapport JUnit XML exploitable par GitHub Actions.
+      // Le dossier de sortie est surchargeable via la variable d'environnement
+      // JUNIT_OUTPUT_DIR (utilisée par run-tests.sh), avec un repli sain.
+      outputDir: process.env.JUNIT_OUTPUT_DIR || 'test-results',
+      outputFile: 'frontend.xml',
+      useBrowserName: false,
     },
     port: 9876,
     colors: true,
