@@ -1,0 +1,113 @@
+###############################################################################
+# Pipeline CI générique — commun aux deux applications (Angular ET Java/Gradle).
+#
+# Le MÊME fichier fonctionne dans les deux dépôts : une étape de détection
+# identifie le type de projet, puis les étapes suivantes s'activent par
+# condition (`if:`) selon ce type. Le script unifié run-tests.sh exécute les
+# tests et produit un rapport JUnit XML, publié ensuite comme "check" GitHub.
+###############################################################################
+name: CI
+
+on:
+  push:
+    branches: ["**"] # toutes les branches -> permet de tester sur une branche de dev
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # déclenchement manuel
+
+# Permissions minimales (principe du moindre privilège).
+# `checks: write` est requis pour publier le rapport de tests dans l'onglet Checks.
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+# Variables d'environnement centralisées : on adapte les versions ici sans
+# toucher au reste du workflow.
+env:
+  NODE_VERSION: "20.19"
+  JAVA_VERSION: "21"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job de test : s'adapte automatiquement au type de projet.
+  # (Les jobs de build / release viendront s'ajouter dans les étapes suivantes ;
+  #  on garde volontairement une structure en jobs distincts.)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests unitaires
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      # --- Détection du type de projet -------------------------------------
+      - name: Détecter le type de projet
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+            echo "Projet Node/Angular détecté."
+          elif [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            echo "Projet Java/Gradle détecté."
+          else
+            echo "::error::Type de projet non reconnu (ni package.json ni Gradle)."
+            exit 1
+          fi
+
+      # --- Chaîne Node / Angular (avec cache npm) --------------------------
+      - name: Configurer Node.js
+        if: steps.detect.outputs.type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm # met en cache ~/.npm d'après package-lock.json
+
+      - name: Installer les dépendances (npm ci)
+        if: steps.detect.outputs.type == 'node'
+        run: npm ci
+
+      - name: Installer Chrome (pour Karma ChromeHeadless)
+        if: steps.detect.outputs.type == 'node'
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
+      # --- Chaîne Java / Gradle (avec cache Gradle) ------------------------
+      - name: Configurer le JDK
+        if: steps.detect.outputs.type == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle # met en cache les dépendances Gradle
+
+      # --- Exécution des tests via le script unifié ------------------------
+      - name: Exécuter les tests unitaires
+        env:
+          # Indique à Karma où trouver Chrome (vide et ignoré pour un projet Gradle).
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          chmod +x run-tests.sh
+          ./run-tests.sh
+
+      # --- Publication du rapport de tests dans GitHub ---------------------
+      # `if: always()` : on publie le rapport même si des tests ont échoué.
+      - name: Publier le rapport de tests (JUnit)
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Rapport de tests unitaires
+          path: test-results/**/*.xml
+          reporter: java-junit # format JUnit XML standard (Karma & Gradle)
+          fail-on-error: false
+
+      # Conservation des rapports bruts comme artefact téléchargeable.
+      - name: Archiver les rapports JUnit
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results/
+          if-no-files-found: warn

@@ -11,6 +11,10 @@ tmp
 
 # Tests & coverage
 coverage
+test-results
+reports
+.npm
+run-tests.sh
 
 # Docker / orchestration files
 Dockerfile
