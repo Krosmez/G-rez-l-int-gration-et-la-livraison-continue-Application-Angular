@@ -197,3 +197,74 @@ jobs:
       - name: Récapitulatif
         if: github.event_name != 'pull_request'
         run: echo "Image publiée -> ${{ steps.meta.outputs.ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Job de release : versioning automatique via semantic-release (Conventional
+  # Commits) -> release GitHub + CHANGELOG + bump de version dans les fichiers,
+  # puis re-tag de l'image Docker déjà publiée avec la version sémantique.
+  #
+  # Déclenchement : uniquement sur un push/merge de la branche main (pas de
+  # release depuis une PR ou une branche de dev).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release & tag sémantique
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # Permissions spécifiques au job (le moindre privilège ailleurs) :
+    # semantic-release doit écrire tags/commit/release et republier l'image.
+    permissions:
+      contents: write # créer tags, release GitHub et pousser le commit de version
+      issues: write # commenter les issues liées
+      pull-requests: write # commenter les PR liées
+      packages: write # re-taguer l'image sur GHCR
+
+    steps:
+      # fetch-depth: 0 -> semantic-release a besoin de tout l'historique + tags.
+      - name: Récupérer le code (historique complet)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Installer les dépendances (npm ci)
+        run: npm ci
+
+      # semantic-release analyse les commits, calcule la version, crée la
+      # release GitHub + CHANGELOG, bump package.json, et — via le plugin exec —
+      # expose la version calculée dans la sortie d'étape `version`.
+      - name: Lancer semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # secret injecté, jamais loggé
+        run: npx semantic-release
+
+      # --- Re-tag de l'image Docker avec la version sémantique --------------
+      # Seulement si une nouvelle version a été publiée (sortie non vide).
+      - name: Se connecter à GitHub Container Registry
+        if: steps.semantic.outputs.version != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On ne reconstruit pas : on ajoute les tags `x.y.z` et `latest` sur
+      # l'image exacte déjà buildée et testée par le job `build` (main-<sha>).
+      - name: Taguer l'image avec la version sémantique
+        if: steps.semantic.outputs.version != ''
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          SOURCE="${IMAGE}:main-${GITHUB_SHA::7}"
+          VERSION="${{ steps.semantic.outputs.version }}"
+          docker buildx imagetools create "$SOURCE" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest"
+          echo "Image taguée -> ${IMAGE}:${VERSION} (+ latest)" >> "$GITHUB_STEP_SUMMARY"
